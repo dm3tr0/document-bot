@@ -1,10 +1,10 @@
 import math
 import re
 from collections import Counter
-from pathlib import Path
 
-SAVE_DIR = Path("storage")  # temporary storage ill make db soon
-ONLY_OWN_DOCUMENTS = False  # False: shared knowledge base for everyone; True: each user sees only their files
+from . import db
+
+ONLY_OWN_DOCUMENTS = False  # False: shared knowledge base for everyone; True: archive + the user's own files
 CHUNK_CHARS = 800
 TOP_K = 4
 
@@ -13,14 +13,6 @@ STOPWORDS = {
     "це", "ці", "коли", "чому", "чим", "щоб", "його", "вона", "вони", "наш", "ваш",
     "треба", "можна", "якщо", "також", "після", "перед", "між", "через", "як", "що",
 }
-
-
-def decode_text(data: bytes) -> str:
-    """UTF-8 first (with BOM support), then Windows-1251, common for older Ukrainian files."""
-    try:
-        return data.decode("utf-8-sig")
-    except UnicodeDecodeError:
-        return data.decode("cp1251", errors="replace")
 
 
 def tokenize(text: str) -> list[str]:
@@ -48,8 +40,10 @@ def chunk_text(text: str, size: int = CHUNK_CHARS) -> list[str]:
             if current:
                 chunks.append(current)
                 current = ""
-            chunks.append(para[:size])
-            para = para[size:]
+            cut = max(para.rfind("\n", 0, size), para.rfind(" ", 0, size))
+            cut = cut if cut > size // 2 else size  # prefer cutting at a line break or space
+            chunks.append(para[:cut].strip())
+            para = para[cut:].strip()
         if not para:
             continue
         if len(current) + len(para) + 2 > size:
@@ -66,21 +60,16 @@ def chunk_text(text: str, size: int = CHUNK_CHARS) -> list[str]:
 def search(query: str, user_id: int | None = None, top_k: int = TOP_K) -> list[tuple[str, str]]:
     """Return up to top_k (source file name, text chunk) pairs, best match first.
 
-    Blocking (reads files from disk): call it with asyncio.to_thread from handlers.
+    Blocking (reads the database): call it with asyncio.to_thread from handlers.
     """
     query_words = list(dict.fromkeys(tokenize(query)))
-    if not query_words or not SAVE_DIR.exists():
+    if not query_words:
         return []
 
     docs = []  # (source, chunk, Counter of words)
-    for path in SAVE_DIR.rglob("*"):
-        if not path.is_file():
-            continue
-        if user_id is not None and path.parent.name != str(user_id):
-            continue
-        source = re.sub(r"^\d+_", "", path.name)  # drop the timestamp prefix
-        for chunk in chunk_text(decode_text(path.read_bytes())):
-            docs.append((source, chunk, Counter(tokenize(chunk))))
+    for row in db.list_documents(user_id):
+        for chunk in chunk_text(row["text"]):
+            docs.append((row["filename"], chunk, Counter(tokenize(chunk))))
     if not docs:
         return []
 

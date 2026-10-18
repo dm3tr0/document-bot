@@ -1,6 +1,7 @@
 # Temporary local storage
 /storage
 /documents
+/archive
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
