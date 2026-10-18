@@ -2,11 +2,12 @@ import math
 import re
 from collections import Counter
 
+from ..formatting import format_source
 from . import db
 
 ONLY_OWN_DOCUMENTS = False  # False: shared knowledge base for everyone; True: archive + the user's own files
 CHUNK_CHARS = 800
-TOP_K = 4
+TOP_K = 6
 
 STOPWORDS = {
     "для", "при", "про", "від", "яка", "який", "які", "яке", "або", "але", "цей", "ця",
@@ -58,7 +59,7 @@ def chunk_text(text: str, size: int = CHUNK_CHARS) -> list[str]:
 
 
 def search(query: str, user_id: int | None = None, top_k: int = TOP_K) -> list[tuple[str, str]]:
-    """Return up to top_k (source file name, text chunk) pairs, best match first.
+    """Return up to top_k (source citation, text chunk) pairs, best match first.
 
     Blocking (reads the database): call it with asyncio.to_thread from handlers.
     """
@@ -66,16 +67,24 @@ def search(query: str, user_id: int | None = None, top_k: int = TOP_K) -> list[t
     if not query_words:
         return []
 
-    docs = []  # (source, chunk, Counter of words)
+    docs = []  # (document id, source, context, local match, word counts)
     for row in db.list_documents(user_id):
+        title = " ".join((row["title"] or row["filename"]).split())
+        source = format_source(row)
+        localities = re.findall(r'рукавич\w*\s+[«"]([^»"]+)[»"]', row["text"], re.IGNORECASE)
+        local_match = any(location.casefold() in query.casefold() for location in localities)
         for chunk in chunk_text(row["text"]):
-            docs.append((row["filename"], chunk, Counter(tokenize(chunk))))
+            context = f"Назва документа: {title}\nКатегорія: {row['category']}\nУривок:\n{chunk}"
+            docs.append((row["id"], source, context, local_match, Counter(tokenize(
+                f"{title}\n{row['category']}\n{chunk}"
+            ))))
     if not docs:
         return []
 
+    # Rank passages by matching word frequency, discounting common query terms.
     tf = [
         [sum(c for w, c in counts.items() if words_match(q, w)) for q in query_words]
-        for _, _, counts in docs
+        for _, _, _, _, counts in docs
     ]
     n = len(docs)
     idf = [
@@ -84,9 +93,18 @@ def search(query: str, user_id: int | None = None, top_k: int = TOP_K) -> list[t
     ]
 
     scored = []
-    for (source, chunk, _), row in zip(docs, tf):
+    for (doc_id, source, chunk, local_match, _), row in zip(docs, tf):
         score = sum(idf[i] * (1 + math.log(t)) for i, t in enumerate(row) if t > 0)
         if score > 0:
-            scored.append((score, source, chunk))
-    scored.sort(key=lambda item: item[0], reverse=True)
-    return [(source, chunk) for _, source, chunk in scored[:top_k]]
+            scored.append((local_match, score, doc_id, source, chunk))
+    scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    # Include the best passage from each relevant document before taking extra
+    # passages from the same one, so one file cannot crowd out other sources.
+    selected, extra, seen = [], [], set()
+    for _, _, doc_id, source, chunk in scored:
+        if doc_id in seen:
+            extra.append((source, chunk))
+        else:
+            seen.add(doc_id)
+            selected.append((source, chunk))
+    return (selected + extra)[:max(0, top_k)]

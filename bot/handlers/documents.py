@@ -1,7 +1,5 @@
 import asyncio
-from datetime import datetime, timezone
 from pathlib import Path
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from aiogram import Bot, F, Router
 from aiogram.filters import Command
@@ -9,46 +7,23 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Message
 
+from ..formatting import format_sender, format_time
 from ..services import db, ingest, knowledge
 from ..services.extract import ALLOWED_EXTENSIONS
+from .common import answer_long
 
 router = Router()
 
 MAX_SIZE = 20 * 1024 * 1024  # Telegram Bot API limit for bot downloads
-MAX_CATEGORY_LEN = 40
 MIME_EXTENSIONS = {
     "text/plain": ".txt",
     "application/pdf": ".pdf",
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
 }
 
-try:
-    LOCAL_TZ = ZoneInfo("Europe/Kyiv")
-except ZoneInfoNotFoundError:  # on Windows this needs: pip install tzdata
-    LOCAL_TZ = timezone.utc
 
-
-class AskCategory(StatesGroup):
-    waiting = State()  # the bot asked which forest part a document is for
-
-
-def format_time(iso: str) -> str:
-    return datetime.fromisoformat(iso).astimezone(LOCAL_TZ).strftime("%d.%m.%Y %H:%M")
-
-
-def format_sender(name: str, username: str | None) -> str:
-    return f"{name} (@{username})" if username else name
-
-
-async def answer_long(message: Message, text: str, limit: int = 4000) -> None:
-    """Send text in several messages if it exceeds Telegram's length limit."""
-    while len(text) > limit:
-        cut = text.rfind("\n", 0, limit)
-        cut = cut if cut > 0 else limit
-        await message.answer(text[:cut])
-        text = text[cut:].lstrip("\n")
-    if text:
-        await message.answer(text)
+class AskRealName(StatesGroup):
+    waiting = State()
 
 
 @router.message(F.document)
@@ -64,68 +39,67 @@ async def handle_document(message: Message, bot: Bot, state: FSMContext):
         await message.answer("Файл завеликий. Ліміт — 20 МБ.")
         return
 
-    await bot.send_chat_action(message.chat.id, "typing")
-    data = (await bot.download(doc)).read()
     user = message.from_user
-    sender = ingest.Sender(id=user.id, name=user.full_name, username=user.username)
+    real_name = await asyncio.to_thread(db.get_real_name, user.id)
+    if real_name is None:
+        # Keep Telegram file metadata, not bytes, while waiting for the name.
+        await state.set_state(AskRealName.waiting)
+        await state.set_data({
+            "file_id": doc.file_id,
+            "filename": name or f"{doc.file_unique_id}{ext}",
+            "uploaded_at": message.date.isoformat(),
+        })
+        await message.answer("Як вас звати насправді? Напишіть ваше справжнє ім’я — я запам’ятаю його для підпису документів. Документ уже очікує на обробку.")
+        return
+    await process_document(message, bot, doc.file_id,
+                           name or f"{doc.file_unique_id}{ext}", real_name,
+                           message.date.isoformat())
+
+
+@router.message(AskRealName.waiting, F.text, ~F.text.startswith("/"))
+async def got_real_name(message: Message, bot: Bot, state: FSMContext):
+    real_name = " ".join(message.text.split())
+    if not 2 <= len(real_name) <= 100 or real_name.startswith("@"):
+        await message.answer("Напишіть ваше справжнє ім’я (від 2 до 100 символів), а не Telegram-логін.")
+        return
+    pending = await state.get_data()
+    await asyncio.to_thread(db.save_real_name, message.from_user.id, real_name)
+    await state.clear()
+    await message.answer(f"Дякую, {real_name}! Ім’я збережено. Обробляю документ.")
+    await process_document(message, bot, pending["file_id"],
+                           pending["filename"], real_name, pending["uploaded_at"])
+
+
+async def process_document(
+    message: Message, bot: Bot, file_id: str, filename: str,
+    real_name: str, uploaded_at: str,
+) -> None:
+    await bot.send_chat_action(message.chat.id, "typing")
+    data = (await bot.download(file_id)).read()
+    user = message.from_user
+    sender = ingest.Sender(id=user.id, name=real_name, username=user.username,
+                           uploaded_at=uploaded_at)
 
     try:
-        result = await ingest.ingest(data, name or f"{doc.file_unique_id}{ext}", sender)
+        result = await ingest.ingest(data, filename, sender)
     except ingest.IngestError as exc:
         await message.answer(str(exc))
         return
 
     if result.duplicate:
-        await message.answer(f"Такий документ уже є в базі: «{result.title}» ({result.category}).")
+        await message.answer(f"Документ «{result.title}» уже є в базі. Дату надсилання оновлено.")
         return
 
     reply = f"Збережено: {result.filename}"
+    if result.updated:
+        reply += "\nПравила оновлено. Попередній зміст документа більше не використовується."
     if result.summary:
         reply += f"\nКоротко: {result.summary}"
     reply += f"\nВід: {format_sender(sender.name, sender.username)}"
-    reply += f"\nКоли: {datetime.now(LOCAL_TZ).strftime('%d.%m.%Y %H:%M')}"
+    reply += f"\nКоли: {format_time(uploaded_at)}"
 
-    if not result.needs_category:
-        reply += f"\nЧастина лісу: {result.category}"
-        await answer_long(message, reply)
-        return
-
-    # The AI could not tell which forest part the advice is for (or was unavailable): ask the user.
-    existing = await asyncio.to_thread(db.list_categories)
-    reply += "\n\nНе можу зрозуміти з тексту, для якої частини лісу ця порада."
-    if not result.ai_ok:
-        reply += " (Аналіз ШІ зараз недоступний.)"
-    reply += "\nНапишіть назву частини лісу, наприклад «Хвойний ліс»."
-    if existing:
-        reply += f"\nУже є: {', '.join(existing)}."
-    reply += "\nАбо /skip, щоб залишити без категорії."
-    await state.set_state(AskCategory.waiting)
-    await state.update_data(doc_id=result.doc_id)
+    reply += f"\nЧастина лісу: {result.category}"
     await answer_long(message, reply)
-
-
-@router.message(AskCategory.waiting, F.text, ~F.text.startswith("/"))
-async def got_category(message: Message, state: FSMContext):
-    text = message.text.strip()
-    if len(text) > MAX_CATEGORY_LEN or "?" in text:
-        await message.answer(
-            f"Напишіть коротку назву частини лісу (до {MAX_CATEGORY_LEN} символів), "
-            "наприклад «Болото», або /skip."
-        )
-        return
-    doc_id = (await state.get_data())["doc_id"]
-    category = await ingest.assign_category(doc_id, text)
-    if category is None:
-        await message.answer("Не вдалося використати таку назву. Спробуйте ще раз або /skip.")
-        return
-    await state.clear()
-    await message.answer(f"Готово. Документ тепер у категорії «{category}».")
-
-
-@router.message(AskCategory.waiting, Command("skip"))
-async def skip_category(message: Message, state: FSMContext):
-    await state.clear()
-    await message.answer(f"Добре, документ залишається в категорії «{db.UNSORTED}».")
 
 
 @router.message(Command("docs"))

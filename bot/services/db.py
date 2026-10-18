@@ -37,6 +37,25 @@ def _connect() -> sqlite3.Connection:
 def init_db() -> None:
     with closing(_connect()) as conn, conn:
         conn.execute(SCHEMA)
+        conn.execute("""CREATE TABLE IF NOT EXISTS users (
+            telegram_id INTEGER PRIMARY KEY,
+            real_name TEXT NOT NULL
+        )""")
+
+
+def get_real_name(telegram_id: int) -> str | None:
+    with closing(_connect()) as conn:
+        row = conn.execute("SELECT real_name FROM users WHERE telegram_id = ?", (telegram_id,)).fetchone()
+        return row["real_name"] if row else None
+
+
+def save_real_name(telegram_id: int, real_name: str) -> None:
+    with closing(_connect()) as conn, conn:
+        conn.execute(
+            "INSERT INTO users (telegram_id, real_name) VALUES (?, ?) "
+            "ON CONFLICT(telegram_id) DO UPDATE SET real_name = excluded.real_name",
+            (telegram_id, real_name),
+        )
 
 
 def find_by_hash(content_hash: str) -> sqlite3.Row | None:
@@ -48,10 +67,10 @@ def find_by_hash(content_hash: str) -> sqlite3.Row | None:
 
 def add_document(
     *, title, filename, category, summary, text, content_hash,
-    sender_id, sender_name, sender_username, from_archive,
+    sender_id, sender_name, sender_username, from_archive, uploaded_at=None,
 ) -> int:
     """Insert a document. Raises sqlite3.IntegrityError if the same content is already stored."""
-    uploaded_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    uploaded_at = uploaded_at or datetime.now(timezone.utc).isoformat(timespec="seconds")
     with closing(_connect()) as conn, conn:
         cursor = conn.execute(
             """INSERT INTO documents (title, filename, category, summary, text, content_hash,
@@ -63,16 +82,35 @@ def add_document(
         return cursor.lastrowid
 
 
-def list_categories(limit: int = 30) -> list[str]:
-    """Categories already in use, most used first (UNSORTED is not a real category)."""
-    with closing(_connect()) as conn:
-        rows = conn.execute(
-            """SELECT category FROM documents WHERE category != ?
-               GROUP BY category ORDER BY COUNT(*) DESC, category LIMIT ?""",
-            (UNSORTED, limit),
-        ).fetchall()
-    names = [row["category"] for row in rows if row["category"] != WHOLE_FOREST]
-    return ([WHOLE_FOREST] + names)[:max(0, limit)]
+def update_document(
+    doc_id: int, *, expected_hash, title, filename, category, summary, text,
+    content_hash, sender_id, sender_name, sender_username, from_archive, uploaded_at=None,
+) -> bool:
+    """Replace content only if it has not changed since the AI compared it.
+
+    The expected hash prevents concurrent uploads from overwriting each other;
+    the timestamp condition prevents an older archive copy restoring old rules.
+    """
+    uploaded_at = uploaded_at or datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with closing(_connect()) as conn, conn:
+        cursor = conn.execute(
+            """UPDATE documents SET title = ?, filename = ?, category = ?, summary = ?,
+                   text = ?, content_hash = ?, sender_id = ?, sender_name = ?,
+                   sender_username = ?, from_archive = ?, uploaded_at = ?
+               WHERE id = ? AND content_hash = ? AND julianday(uploaded_at) <= julianday(?)""",
+            (title, filename, category, summary, text, content_hash, sender_id, sender_name,
+             sender_username, int(from_archive), uploaded_at, doc_id, expected_hash, uploaded_at),
+        )
+        return cursor.rowcount == 1
+
+
+def refresh_uploaded_at(doc_id: int, uploaded_at: str | None = None) -> None:
+    uploaded_at = uploaded_at or datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with closing(_connect()) as conn, conn:
+        conn.execute(
+            "UPDATE documents SET uploaded_at = ? WHERE id = ? AND julianday(uploaded_at) <= julianday(?)",
+            (uploaded_at, doc_id, uploaded_at),
+        )
 
 
 def list_categories(limit: int = 30) -> list[str]:
@@ -85,19 +123,24 @@ def list_categories(limit: int = 30) -> list[str]:
         ).fetchall()
     names = [row["category"] for row in rows if row["category"] != WHOLE_FOREST]
     return ([WHOLE_FOREST] + names)[:max(0, limit)]
+
+
+def list_documents(user_id: int | None = None) -> list[sqlite3.Row]:
+    """List documents newest first, optionally limited to the user and archive."""
+    query = "SELECT d.* FROM documents d WHERE 1 = 1"
+    parameters = ()
+    if user_id is not None:
+        query += " AND (d.sender_id = ? OR d.from_archive = 1)"
+        parameters = (user_id,)
+    query += " ORDER BY julianday(d.uploaded_at) DESC, d.id DESC"
+    with closing(_connect()) as conn:
+        return conn.execute(query, parameters).fetchall()
 
 
 def get_document(doc_id: int) -> sqlite3.Row | None:
     with closing(_connect()) as conn:
         return conn.execute("SELECT * FROM documents WHERE id = ?", (doc_id,)).fetchone()
 
-
-def update_category(doc_id: int, category: str, filename: str) -> None:
-    with closing(_connect()) as conn, conn:
-        conn.execute(
-            "UPDATE documents SET category = ?, filename = ? WHERE id = ?",
-            (category, filename, doc_id),
-        )
 
 def remove_missing_archive(present_hashes: set[str]) -> int:
     """Drop archive rows whose file is no longer in the archive folder. Returns how many."""
@@ -106,5 +149,3 @@ def remove_missing_archive(present_hashes: set[str]) -> int:
         stale = [(row["id"],) for row in rows if row["content_hash"] not in present_hashes]
         conn.executemany("DELETE FROM documents WHERE id = ?", stale)
         return len(stale)
-
-

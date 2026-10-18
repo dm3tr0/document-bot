@@ -1,7 +1,13 @@
-# Temporary local storage
+# macOS metadata
+.DS_Store
+
+# Local files
+AGENTS.md
 /storage
+documents.db
 /documents
 /archive
+/manual-tests
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

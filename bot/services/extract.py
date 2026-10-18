@@ -5,9 +5,9 @@ from docx import Document
 from pypdf import PdfReader
 
 
-
 class OCRUnavailableError(RuntimeError):
-    """OCR dependencies or language data are missing."""
+    """The PDF renderer needed for vision transcription is unavailable."""
+
 
 ALLOWED_EXTENSIONS = {".txt", ".pdf", ".docx"}
 
@@ -35,6 +35,7 @@ def extract_text(data: bytes, ext: str) -> str:
                 parts.append(" | ".join(cell.text for cell in row.cells))
         return "\n\n".join(p for p in parts if p.strip())
     raise ValueError(f"Unsupported extension: {ext}")
+
 
 def _pdf_pages(data: bytes) -> list[tuple[str, bool]]:
     """Native text and whether a textless page needs visual extraction."""
