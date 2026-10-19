@@ -98,7 +98,7 @@ async def process_document(
     reply += f"\nВід: {format_sender(sender.name, sender.username)}"
     reply += f"\nКоли: {format_time(uploaded_at)}"
 
-    reply += f"\nЧастина лісу: {result.category}"
+    reply += f"\nКатегорія: {result.category}"
     await answer_long(message, reply)
 
 

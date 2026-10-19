@@ -4,7 +4,7 @@
 # Local files
 AGENTS.md
 /storage
-documents.db
+documents*.db
 /documents
 /archive
 /manual-tests

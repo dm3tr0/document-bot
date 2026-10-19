@@ -3,6 +3,7 @@ import hashlib
 import logging
 import re
 import sqlite3
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,12 +14,13 @@ from ..config import settings
 from . import db, llm
 from .db import WHOLE_FOREST
 from .extract import ALLOWED_EXTENSIONS, OCRUnavailableError, extract_document
-from .knowledge import tokenize, words_match
+from .knowledge import chunk_text, tokenize, words_match
 
 log = logging.getLogger(__name__)
 
 UPDATE_CANDIDATES = 8
-COMPARISON_BATCH_SIZE = 4
+NEW_DOCUMENT_CHARS = 3000
+CANDIDATE_CHARS = 800
 
 # What the AI (or a user) may answer when the forest part is not clear.
 UNKNOWN_WORDS = {"unknown", "невідомо", "не визначено", "не зрозуміло", "без категорії", "none", "n/a", "-"}
@@ -56,7 +58,7 @@ def clean_title(raw: str, limit: int = 80) -> str:
 
 def normalize_category(raw: str, existing: list[str]) -> str | None:
     """Tidy a category name. None means 'unclear'. Reuses an existing name that differs only in case."""
-    name = clean_title(raw, limit=40)
+    name = clean_title(raw, limit=120)
     if not name or name.casefold() in UNKNOWN_WORDS:
         return None
     if name.casefold() == WHOLE_FOREST.casefold():
@@ -87,30 +89,52 @@ def _duplicate(row: sqlite3.Row) -> Result:
     return Result(row["id"], row["title"], row["filename"], row["category"], row["summary"], duplicate=True)
 
 
-async def find_update(text: str, filename: str) -> sqlite3.Row | None:
-    """Shortlist by word overlap, then let AI check purpose and exact location."""
-    documents = await asyncio.to_thread(db.list_documents)
-    query_words = set(tokenize(filename + " " + text))
+def comparison_excerpt(text: str, query_words: set[str], limit: int) -> str:
+    """Retain scope near the heading, relevant advice, and the ending within a cap."""
+    if len(text) <= limit:
+        return text
+    head_size, tail_size = limit // 3, limit // 6
+    middle = text[head_size:-tail_size]
+    passages = chunk_text(middle, size=max(100, limit // 2))
+    def relevance(passage):
+        return sum(any(words_match(word, query) for query in query_words)
+                   for word in set(tokenize(passage)))
+    best = max(passages, key=relevance, default="")
+    separator = "\n[...]\n"
+    remaining = limit - head_size - tail_size - 2 * len(separator)
+    return text[:head_size] + separator + best[:remaining] + separator + text[-tail_size:]
 
+
+def prepare_analysis(text: str, documents: list) -> tuple[str, list[dict]]:
+    """Bound request size while preserving candidate IDs for safe updates."""
+    sample = comparison_excerpt(text, set(tokenize(text[:500])), NEW_DOCUMENT_CHARS)
+    query_words = set(tokenize(sample))
     def similarity(row):
-        title_words = set(tokenize(row["title"]))
         body_words = set(tokenize(row["text"]))
-        return sum(
-            (3 if word in title_words else 1)
-            for word in title_words | body_words
-            if any(words_match(word, query) for query in query_words)
-        )
-    # Shortlist related advice before AI comparison to avoid sending the whole
-    # archive on every upload. Exact scope is checked by the model, not category.
+        return sum(1 for word in body_words
+                   if any(words_match(word, query) for query in query_words))
     ranked = sorted(((similarity(row), row) for row in documents),
                     key=lambda item: item[0], reverse=True)
-    related = [row for score, row in ranked[:UPDATE_CANDIDATES] if score > 0]
-    for offset in range(0, len(related), COMPARISON_BATCH_SIZE):
-        candidates = related[offset:offset + COMPARISON_BATCH_SIZE]
-        doc_id = await llm.find_updated_document(text, filename, candidates)
-        if doc_id is not None:
-            return next(row for row in candidates if row["id"] == doc_id)
-    return None
+    candidates = [
+        {"id": row["id"], "категорія": row["category"],
+         "опис": row["summary"][:240],
+         "текст": comparison_excerpt(row["text"], query_words, CANDIDATE_CHARS)}
+        for score, row in ranked[:UPDATE_CANDIDATES] if score > 0
+    ]
+    return sample, candidates
+
+
+async def analyze_document(text: str) -> tuple[llm.DocumentAnalysis, sqlite3.Row | None]:
+    documents = await asyncio.to_thread(db.list_documents)
+    categories = await asyncio.to_thread(db.list_categories)
+    sample, candidates = await asyncio.to_thread(prepare_analysis, text, documents)
+    started_at = time.monotonic()
+    analysis = await llm.analyze_document(sample, categories, candidates)
+    log.info("Document analysis candidates=%d context_chars=%d elapsed_seconds=%.2f",
+             len(candidates), len(sample) + sum(len(row["текст"]) for row in candidates),
+             time.monotonic() - started_at)
+    previous = next((row for row in documents if row["id"] == analysis.update_id), None)
+    return analysis, previous
 
 
 async def ingest(data: bytes, original_name: str, sender: Sender) -> Result:
@@ -141,17 +165,14 @@ async def ingest(data: bytes, original_name: str, sender: Sender) -> Result:
     if not text.strip():
         raise IngestError("У файлі немає тексту, який я можу прочитати.")
 
-    categories = await asyncio.to_thread(db.list_categories)
     try:
-        raw_category, ai_title, summary = await llm.classify(text, categories, filename=original_name)
-    except (APIError, llm.ClassificationError):
-        log.warning("Document analysis failed; saved in whole-forest category")
-        raw_category, ai_title, summary = "", "", ""
-    try:
-        previous = await find_update(text, original_name)
+        analysis, previous = await analyze_document(text)
     except (APIError, llm.ClassificationError) as exc:
-        raise IngestError("Не вдалося перевірити, чи документ оновлює наявні правила. Спробуйте пізніше.") from exc
-    category = normalize_category(raw_category, categories) or WHOLE_FOREST
+        # Do not insert an unverified second copy if the combined request fails.
+        raise IngestError("Не вдалося проаналізувати документ і перевірити оновлення правил. Спробуйте пізніше.") from exc
+    categories = await asyncio.to_thread(db.list_categories)
+    category = normalize_category(analysis.category, categories) or WHOLE_FOREST
+    ai_title, summary = analysis.title, analysis.summary
 
     first_line = next((line for line in text.splitlines() if line.strip()), "")
     stem = clean_title(Path(original_name).stem)
@@ -235,17 +256,14 @@ async def import_archive() -> None:
                 log.warning("Archive file %s has no readable text, skipped", path.name)
                 continue
 
-            categories = await asyncio.to_thread(db.list_categories)  # includes ones created a moment ago
             try:
-                await asyncio.sleep(1)
-                previous = await find_update(text, path.name)
+                analysis, previous = await analyze_document(text)
                 if previous is not None:
                     # An old archive file must not reintroduce replaced rules at restart.
                     if datetime.fromtimestamp(path.stat().st_mtime, timezone.utc) <= datetime.fromisoformat(previous["uploaded_at"]):
                         if previous["from_archive"]:
                             present.add(previous["content_hash"])
                         continue
-                raw_category, _, summary = await llm.classify(text, categories, filename=path.name)
             except RateLimitError:
                 # Stop this batch rather than exhausting retries again for every file.
                 # Leave existing rows untouched; pending files retry at next startup.
@@ -257,11 +275,13 @@ async def import_archive() -> None:
             except APIError as exc:
                 log.warning("Archive file %s skipped, AI unavailable (retry on next start): %s", path.name, type(exc).__name__)
                 continue
-            category = normalize_category(raw_category, categories) or WHOLE_FOREST
+            categories = await asyncio.to_thread(db.list_categories)
+            category = normalize_category(analysis.category, categories) or WHOLE_FOREST
+            summary = analysis.summary
 
             try:
                 fields = dict(
-                    title=path.stem, filename=path.name, category=category, summary=summary, text=text,
+                    title=clean_title(analysis.title) or "Документ", filename=path.name, category=category, summary=summary, text=text,
                     content_hash=content_hash, sender_id=None, sender_name=db.ARCHIVE,
                     sender_username=None, from_archive=True,
                     uploaded_at=datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat(),
