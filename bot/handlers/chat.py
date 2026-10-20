@@ -14,6 +14,7 @@ log = logging.getLogger(__name__)
 
 @router.message(F.text, ~F.text.startswith("/"))
 async def chat(message: Message):
+    # Text messages are questions only; document ingestion requires a file upload.
     await message.bot.send_chat_action(message.chat.id, "typing")
 
     user_id = message.from_user.id if knowledge.ONLY_OWN_DOCUMENTS else None

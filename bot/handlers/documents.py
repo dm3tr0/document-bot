@@ -15,6 +15,9 @@ from .common import answer_long
 router = Router()
 
 MAX_SIZE = 20 * 1024 * 1024  # Telegram Bot API limit for bot downloads
+PHOTO_REJECTION = (
+    "Фото документів не приймаю. Надішліть документ файлом у форматі .txt, .pdf або .docx."
+)
 MIME_EXTENSIONS = {
     "text/plain": ".txt",
     "application/pdf": ".pdf",
@@ -26,12 +29,20 @@ class AskRealName(StatesGroup):
     waiting = State()
 
 
+@router.message(F.photo)
+async def reject_photo(message: Message):
+    await message.answer(PHOTO_REJECTION)
+
+
 @router.message(F.document)
 async def handle_document(message: Message, bot: Bot, state: FSMContext):
     doc = message.document
     name = doc.file_name or ""
     ext = Path(name).suffix.lower() or MIME_EXTENSIONS.get(doc.mime_type or "", "")
 
+    if (doc.mime_type or "").startswith("image/"):
+        await message.answer(PHOTO_REJECTION)
+        return
     if ext not in ALLOWED_EXTENSIONS:
         await message.answer("Надішліть, будь ласка, файл у форматі .txt, .pdf або .docx.")
         return

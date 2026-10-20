@@ -1,0 +1,19 @@
+services:
+  bot:
+    build: .
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 30s
+    env_file:
+      - .env
+    # Keep host paths in .env from overriding paths inside the container.
+    environment:
+      DB_PATH: /data/documents.db
+      STORAGE_DIR: /data/storage
+      ARCHIVE_DIR: /app/archive
+    volumes:
+      - bot-data:/data
+      - ./archive:/app/archive:ro
+
+volumes:
+  bot-data:

@@ -1,0 +1,9 @@
+# Only application sources and dependencies belong in the build context.
+**
+!Dockerfile
+!requirements.txt
+!bot/
+!bot/**
+**/__pycache__/
+**/*.pyc
+**/.DS_Store

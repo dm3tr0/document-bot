@@ -14,8 +14,8 @@ class Settings(BaseSettings):
     llm_requests_per_minute: int = Field(default=20, gt=0)
     llm_tokens_per_minute: int = Field(default=6000, gt=0)
     llm_max_retries: int = Field(default=3, ge=0, le=10)
-    llm_vision_model: str = "qwen/qwen3.8-27b"
-    import_archive: bool = True  # disable background archive processing during testing
+    llm_vision_model: str
+    import_archive: bool = False  # disable background archive processing during testing
     storage_dir: Path = ROOT / "storage"  # all uploaded documents
     archive_dir: Path = ROOT / "archive"  # starting archive, imported on startup
     db_path: Path = ROOT / "documents.db"  # who/when/category for every document
